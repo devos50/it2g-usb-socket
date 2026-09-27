@@ -38,7 +38,7 @@ def dfu_get_status(link):
 
 
 def print_device_info(link):
-    desc = link.get_descriptor(0x01, 0, 18)
+    desc = link.wait_for_device()
     vid, pid = struct.unpack_from("<HH", desc, 8)
     print("Device %04x:%04x" % (vid, pid))
     if desc[16]:
