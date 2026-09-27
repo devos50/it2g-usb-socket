@@ -39,6 +39,23 @@ accesses.
   - `querytype`: asks lockdownd (port 62078) for its type
   - `getvalue [key]`: reads lockdownd values (without pairing, only the
     public ones such as `UniqueDeviceID`)
+- `usbmuxd.py`: a usbmuxd replacement for libimobiledevice. It keeps the
+  USB link open (reconnecting when QEMU restarts) and serves the usbmuxd plist
+  protocol on 127.0.0.1:27015 (`--listen host:port` or `UNIX:<path>`). Pair
+  records are stored in `~/.it2g-usbmuxd`, not in `/var/db/lockdown`:
+
+  ```
+  python3 usbmuxd.py
+  export USBMUXD_SOCKET_ADDRESS=127.0.0.1:27015
+  idevice_id -l
+  ideviceinfo
+  iproxy 2222:62078
+  ```
+
+  The device appears once iOS has gone on the bus, which needs the
+  `com.apple.usbptpd.plist` launch daemon on the root filesystem: the kernel
+  only connects when every function of the USB configuration (including PTP)
+  has registered.
 
 ## Smoke test
 
