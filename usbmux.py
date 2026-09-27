@@ -48,35 +48,48 @@ class MuxConnection:
         self.dport = dport
         self.tx_seq = 0
         self.tx_ack = 0
+        self.tx_acked = 0
         self.tx_win = 0
         self.state = "connecting"
         self._rx = bytearray()
         self._cond = threading.Condition()
+        # Serializes packets so their sequence numbers go out in order,
+        # without holding _cond during a USB transfer.
+        self._tx_lock = threading.Lock()
 
     def _send_tcp(self, flags, data=b""):
-        header = TCP_HEADER.pack(self.sport, self.dport, self.tx_seq, self.tx_ack,
-                                 (TCP_HEADER.size // 4) << 4, flags, RX_WINDOW >> 8, 0, 0)
-        self.mux._send(MUX_TCP, header + data)
+        with self._tx_lock:
+            with self._cond:
+                header = TCP_HEADER.pack(self.sport, self.dport, self.tx_seq, self.tx_ack,
+                                         (TCP_HEADER.size // 4) << 4, flags, RX_WINDOW >> 8, 0, 0)
+                self.tx_seq += len(data)
+            self.mux._send(MUX_TCP, header + data)
 
     def _input(self, flags, seq, ack, win, data):
+        send_ack = False
         with self._cond:
             if flags & TH_RST:
                 self.state = "refused" if self.state == "connecting" else "closed"
             elif self.state == "connecting" and flags & TH_SYN and flags & TH_ACK:
                 self.tx_seq += 1
                 self.tx_ack += 1
+                self.tx_acked = ack
                 self.tx_win = win << 8
                 self.state = "connected"
-                self._send_tcp(TH_ACK)
+                send_ack = True
             elif self.state == "connected":
                 self.tx_win = win << 8
+                if flags & TH_ACK:
+                    self.tx_acked = ack
                 if data:
                     self.tx_ack += len(data)
                     self._rx += data
-                    self._send_tcp(TH_ACK)
+                    send_ack = True
                 if flags & TH_FIN:
                     self.state = "closed"
             self._cond.notify_all()
+        if send_ack:
+            self._send_tcp(TH_ACK)
 
     def _wait_state(self, timeout):
         with self._cond:
@@ -85,14 +98,29 @@ class MuxConnection:
             if self.state != "connected":
                 raise MuxError("connection to port %d refused" % self.dport)
 
+    def _in_flight(self):
+        return (self.tx_seq - self.tx_acked) & 0xFFFFFFFF
+
     def send(self, data):
+        """Sends data, waiting while the device's receive window is full."""
         for offset in range(0, len(data), MAX_SEGMENT):
             segment = data[offset:offset + MAX_SEGMENT]
             with self._cond:
+                self._cond.wait_for(lambda: self.state != "connected"
+                                    or self._in_flight() + len(segment) <= self.tx_win)
                 if self.state != "connected":
                     raise MuxError("connection closed")
-                self._send_tcp(TH_ACK, segment)
-                self.tx_seq += len(segment)
+            self._send_tcp(TH_ACK, segment)
+
+    def recv(self, bufsize, timeout=None):
+        """Returns up to bufsize bytes as soon as some are available, or b""
+        once the connection is closed."""
+        with self._cond:
+            if not self._cond.wait_for(lambda: self._rx or self.state != "connected", timeout):
+                raise MuxError("timed out waiting for data")
+            data = bytes(self._rx[:bufsize])
+            del self._rx[:bufsize]
+            return data
 
     def recv_exact(self, length, timeout=10):
         with self._cond:
@@ -106,9 +134,14 @@ class MuxConnection:
 
     def close(self):
         with self._cond:
-            if self.state == "connected":
-                self._send_tcp(TH_RST)
+            connected = self.state == "connected"
             self.state = "closed"
+            self._cond.notify_all()
+        if connected:
+            try:
+                self._send_tcp(TH_RST)
+            except (USBError, ConnectionError, OSError):
+                pass
         self.mux._forget(self)
 
 
@@ -131,6 +164,7 @@ class MuxDevice:
         self._version = None
         self._version_event = threading.Event()
         self._closing = False
+        self.closed = threading.Event()
         self._reader = threading.Thread(target=self._read_loop, daemon=True)
         self._reader.start()
 
@@ -174,6 +208,8 @@ class MuxDevice:
                 conns = list(self._conns.values())
             for conn in conns:
                 conn._input(TH_RST, 0, 0, 0, b"")
+        finally:
+            self.closed.set()
 
     def _dispatch(self, protocol, payload):
         if protocol == MUX_VERSION:
