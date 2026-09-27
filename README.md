@@ -31,6 +31,15 @@ accesses.
 
 `recovery.py --pcap <file>` records the traffic for Wireshark.
 
+- `usbmux.py`: talks usbmux to a booted iOS, like usbmuxd. It selects the
+  configuration with the mux interface (ff/fe/02), does the version
+  handshake (iOS 2 speaks mux protocol version 1) and opens TCP connections
+  to device ports:
+  - `version`: the mux version handshake
+  - `querytype`: asks lockdownd (port 62078) for its type
+  - `getvalue [key]`: reads lockdownd values (without pairing, only the
+    public ones such as `UniqueDeviceID`)
+
 ## Smoke test
 
 `python3 smoke_test.py` starts its own QEMU (paths default to the usual
