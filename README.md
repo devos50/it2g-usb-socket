@@ -78,6 +78,50 @@ syslogd launch daemon), AFC (`afcclient`, ~20 MB/s up, ~55 MB/s down),
 and `iproxy`. `idevicediagnostics` and `idevicecrashreport` use services that
 iOS 2 does not have.
 
+## SSH into iOS
+
+The filesystem image built by `generate_nand_it2g` has OpenSSH 5.2, bash and
+coreutils (see its README). launchd starts `sshd` when something connects to
+port 22, which `iproxy` forwards over usbmux. In separate terminals:
+
+```
+python3 run_ios.py
+USBMUXD_SOCKET_ADDRESS=127.0.0.1:27015 iproxy 2222 22
+ssh -p 2222 -o HostKeyAlgorithms=+ssh-rsa -o KexAlgorithms=+diffie-hellman-group14-sha1 \
+    -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null root@127.0.0.1
+```
+
+Start `iproxy` once the device is attached (`idevice_id -l` lists it). The
+password is `alpine`, for both `root` and `mobile`. A modern OpenSSH client
+only talks to OpenSSH 5.2 with the `ssh-rsa` host key algorithm and the
+`diffie-hellman-group14-sha1` key exchange enabled. Without `--scratch-nand`,
+changes made over SSH stay on the NAND.
+
+To just type `ssh ipod`, add this to `~/.ssh/config`:
+
+```
+Host ipod
+    HostName 127.0.0.1
+    Port 2222
+    User root
+    HostKeyAlgorithms +ssh-rsa
+    KexAlgorithms +diffie-hellman-group14-sha1
+    StrictHostKeyChecking no
+    UserKnownHostsFile /dev/null
+```
+
+Files can be copied with `sftp ipod` or `scp -O` (the legacy scp protocol),
+e.g. `scp -O ipod:/var/mobile/Library/Preferences/com.apple.springboard.plist .`.
+
+On the device:
+
+- `launchctl stop com.apple.SpringBoard` restarts SpringBoard (a respring):
+  its launch daemon has `KeepAlive`, so launchd starts it again.
+- There is no `ps`, `killall` or `grep`. `launchctl list` shows the PIDs of
+  launchd jobs, for use with `kill`.
+- There is no `plutil`. Most plists are binary, so edit them on the Mac
+  (`plutil -convert xml1`) and copy them back.
+
 ## Smoke test
 
 `python3 smoke_test.py` starts its own QEMU (paths default to the usual
