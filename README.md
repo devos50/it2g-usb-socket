@@ -31,6 +31,13 @@ accesses.
 
 `recovery.py --pcap <file>` records the traffic for Wireshark.
 
+## Smoke test
+
+`python3 smoke_test.py` starts its own QEMU (paths default to the usual
+locations, see `--help`), walks DFU -> iBSS -> iBEC over USB and checks
+enumeration, commands, the serial console, uploads and `go`. It takes a few
+seconds and exits non-zero on failure.
+
 ## Booting iBEC over USB
 
 With the 2.1.1 restore files (iBSS and iBEC are not encrypted):

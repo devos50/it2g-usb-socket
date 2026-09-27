@@ -64,6 +64,10 @@ class Transfer:
     def done(self):
         return self._done.is_set()
 
+    def wait_done(self, timeout=None):
+        """Waits until the transfer is answered, returns False on timeout."""
+        return self._done.wait(timeout)
+
 
 class PcapWriter:
     """Writes transfers in the Linux usbmon format, which Wireshark decodes."""
