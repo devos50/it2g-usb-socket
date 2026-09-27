@@ -55,9 +55,11 @@ class DeviceManager:
         self.properties = None
         self._listeners = set()
         self._lock = threading.Lock()
+        self.attached = threading.Event()
         threading.Thread(target=self._run, daemon=True).start()
 
     def _run(self):
+        waiting = False
         while True:
             try:
                 link = USBLink(self.host, self.port)
@@ -68,10 +70,13 @@ class DeviceManager:
                 mux = MuxDevice(link)
                 mux.handshake()
             except (USBError, MuxError, ConnectionError, OSError) as e:
-                log("no device yet (%s)" % e)
+                if not waiting:
+                    log("waiting for the device (%s)" % e)
+                    waiting = True
                 link.close()
                 time.sleep(1)
                 continue
+            waiting = False
             self._attach(mux)
             mux.closed.wait()
             self._detach()
@@ -91,6 +96,7 @@ class DeviceManager:
             }
             listeners = list(self._listeners)
         log("device %d attached: %s" % (self.device_id, mux.serial))
+        self.attached.set()
         for client in listeners:
             client.send_attached(self.device_id, self.properties)
 
@@ -98,6 +104,7 @@ class DeviceManager:
         with self._lock:
             device_id, self.mux, self.properties = self.device_id, None, None
             listeners = list(self._listeners)
+        self.attached.clear()
         log("device %d detached" % device_id)
         for client in listeners:
             client.send_message({"MessageType": "Detached", "DeviceID": device_id})
@@ -304,6 +311,23 @@ def make_server(address):
     return server
 
 
+def start_bridge(listen, host="127.0.0.1", port=1235, pair_records=DEFAULT_PAIR_RECORDS):
+    """Serves the usbmuxd protocol on listen in background threads and
+    returns the DeviceManager."""
+    records = PairRecords(pair_records)
+    devices = DeviceManager(host, port)
+    server = make_server(listen)
+
+    def accept_loop():
+        while True:
+            sock, _ = server.accept()
+            threading.Thread(target=Client(sock, devices, records).run, daemon=True).start()
+
+    threading.Thread(target=accept_loop, daemon=True).start()
+    log("listening on %s, use USBMUXD_SOCKET_ADDRESS=%s" % (listen, listen))
+    return devices
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--listen", default="127.0.0.1:27015",
@@ -313,14 +337,9 @@ def main():
     parser.add_argument("--pair-records", default=DEFAULT_PAIR_RECORDS)
     args = parser.parse_args()
 
-    records = PairRecords(args.pair_records)
-    devices = DeviceManager(args.host, args.port)
-    server = make_server(args.listen)
-    log("listening on %s, use USBMUXD_SOCKET_ADDRESS=%s" % (args.listen, args.listen))
+    start_bridge(args.listen, args.host, args.port, args.pair_records)
     try:
-        while True:
-            sock, _ = server.accept()
-            threading.Thread(target=Client(sock, devices, records).run, daemon=True).start()
+        threading.Event().wait()
     except KeyboardInterrupt:
         pass
 

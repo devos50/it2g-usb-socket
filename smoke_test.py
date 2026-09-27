@@ -4,10 +4,16 @@ walks DFU -> iBSS -> iBEC over USB, checking each step. Takes a few seconds.
 
   python3 smoke_test.py [--qemu ...] [--firmware ...]
 
+With --ios it instead boots iOS from a clone of the NAND (so the NAND is not
+modified) and checks that the device appears through the usbmuxd bridge and
+answers lockdownd. That takes a few minutes.
+
 Exits with 0 when every step passes.
 """
 import argparse
 import os
+import plistlib
+import shutil
 import socket
 import struct
 import subprocess
@@ -15,75 +21,16 @@ import sys
 import tempfile
 import time
 
+from emulator import Emulator, EmulatorError, add_arguments, wait_for
 from main import dfu_upload
 from recovery import upload
-from usb_link import USBLink, USBNoDevice, USBStall, USBTimeout
+from usb_link import USBNoDevice, USBStall, USBTimeout
 
-DOCS = os.path.expanduser("~/Documents")
 DFU_PID = 0x1227
 RECOVERY_PID = 0x1281
+IOS_BOOT_TIMEOUT = 600
 
-
-class StepFailed(Exception):
-    pass
-
-
-def free_port():
-    with socket.socket() as s:
-        s.bind(("127.0.0.1", 0))
-        return s.getsockname()[1]
-
-
-def wait_for(predicate, timeout, what):
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        if predicate():
-            return
-        time.sleep(0.1)
-    raise StepFailed("timed out waiting for %s" % what)
-
-
-class Emulator:
-    def __init__(self, args, workdir):
-        self.port = free_port()
-        self.serial_log = os.path.join(workdir, "serial.log")
-        cmd = [
-            args.qemu, "-M",
-            "iPod-Touch,bootrom=%s,nand=%s,nor=%s,usb-chardev=usb,dfu=on" % (args.bootrom, args.nand, args.nor),
-            "-cpu", "max", "-m", "2G", "-display", "none", "-monitor", "none",
-            "-serial", "file:" + self.serial_log,
-            "-chardev", "socket,id=usb,host=127.0.0.1,port=%d,server=on,wait=off,nodelay=on" % self.port,
-        ]
-        self.log = open(os.path.join(workdir, "qemu.log"), "w")
-        self.proc = subprocess.Popen(cmd, stdout=self.log, stderr=subprocess.STDOUT)
-
-    def serial(self):
-        try:
-            with open(self.serial_log, errors="replace") as f:
-                return f.read()
-        except FileNotFoundError:
-            return ""
-
-    def connect(self):
-        link = None
-
-        def try_connect():
-            nonlocal link
-            if self.proc.poll() is not None:
-                raise StepFailed("QEMU exited with %d" % self.proc.returncode)
-            try:
-                link = USBLink("127.0.0.1", self.port)
-                return True
-            except ConnectionRefusedError:
-                return False
-
-        wait_for(try_connect, 10, "the USB link socket")
-        return link
-
-    def stop(self):
-        self.proc.kill()
-        self.proc.wait()
-        self.log.close()
+StepFailed = EmulatorError
 
 
 def enumerate_device(link, expected_pid):
@@ -130,7 +77,7 @@ def run(args):
         ibec_data = f.read()
 
     workdir = tempfile.mkdtemp(prefix="it2g-smoke-")
-    emu = Emulator(args, workdir)
+    emu = Emulator(args, workdir, dfu=True)
     link = None
     state = {}
 
@@ -188,10 +135,22 @@ def run(args):
         ("iBEC enumerates, console works", step_ibec_enumerates),
     ]
 
+    try:
+        link = emu.connect()
+    except EmulatorError as e:
+        emu.stop()
+        print("FAIL  %-34s %s" % ("USB link connects", e))
+        return 1
+    try:
+        return run_steps(emu, steps, workdir)
+    finally:
+        link.close()
+
+
+def run_steps(emu, steps, workdir):
     start = time.monotonic()
     failed = False
     try:
-        link = emu.connect()
         for name, fn in steps:
             step_start = time.monotonic()
             try:
@@ -202,23 +161,99 @@ def run(args):
                 break
             print("ok    %-34s %.2f s" % (name, time.monotonic() - step_start))
     finally:
-        if link:
-            link.close()
         emu.stop()
 
     print("%s in %.1f s (logs in %s)" % ("FAILED" if failed else "PASSED", time.monotonic() - start, workdir))
     return 1 if failed else 0
 
 
+def run_ios(args):
+    """Boots iOS from a clone of the NAND and checks that it appears through
+    the usbmuxd bridge and answers lockdownd. Takes a few minutes."""
+    from usbmuxd import start_bridge
+
+    workdir = tempfile.mkdtemp(prefix="it2g-smoke-ios-")
+    emu = Emulator(args, workdir, scratch_nand=True)
+    listen = "127.0.0.1:%d" % free_listen_port()
+    devices = start_bridge(listen, port=emu.port, pair_records=os.path.join(workdir, "pair_records"))
+    env = dict(os.environ, USBMUXD_SOCKET_ADDRESS=listen)
+
+    def step_attached():
+        deadline = time.monotonic() + IOS_BOOT_TIMEOUT
+        while not devices.attached.wait(1):
+            emu.check_running()
+            if time.monotonic() > deadline:
+                raise StepFailed("the device did not attach within %d s" % IOS_BOOT_TIMEOUT)
+
+    def step_querytype():
+        device_id, _, _ = devices.current()
+        reply = muxd_request(listen, {"MessageType": "Connect", "DeviceID": device_id,
+                                      "PortNumber": socket.htons(62078)}, tunnel=True)
+        if reply.get("Type") != "com.apple.mobile.lockdown":
+            raise StepFailed("unexpected QueryType reply %r" % reply)
+
+    def step_ideviceinfo():
+        if not shutil.which("ideviceinfo"):
+            print("      (ideviceinfo not installed, skipped)")
+            return
+        out = subprocess.run(["ideviceinfo", "-s", "-k", "DeviceClass"], env=env,
+                             capture_output=True, text=True, timeout=30)
+        if out.stdout.strip() != "iPod":
+            raise StepFailed("ideviceinfo printed %r %r" % (out.stdout, out.stderr))
+
+    steps = [
+        ("iOS boots and attaches over usbmux", step_attached),
+        ("lockdownd QueryType via the bridge", step_querytype),
+        ("ideviceinfo -s via the bridge", step_ideviceinfo),
+    ]
+    return run_steps(emu, steps, workdir)
+
+
+def free_listen_port():
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
+def muxd_request(listen, message, tunnel=False):
+    """Sends one usbmuxd request. With tunnel, the request is a Connect to
+    lockdownd and the lockdownd QueryType reply is returned."""
+    header = struct.Struct("<IIII")
+    host, _, port = listen.rpartition(":")
+    with socket.create_connection((host, int(port)), timeout=30) as s:
+        body = plistlib.dumps(message)
+        s.sendall(header.pack(header.size + len(body), 1, 8, 1) + body)
+        length = header.unpack(recv_exact(s, header.size))[0]
+        reply = plistlib.loads(recv_exact(s, length - header.size))
+        if not tunnel:
+            return reply
+        if reply.get("Number") != 0:
+            raise StepFailed("Connect failed: %r" % reply)
+        body = plistlib.dumps({"Label": "smoke_test", "Request": "QueryType"})
+        s.sendall(struct.pack(">I", len(body)) + body)
+        length = struct.unpack(">I", recv_exact(s, 4))[0]
+        return plistlib.loads(recv_exact(s, length))
+
+
+def recv_exact(sock, length):
+    data = b""
+    while len(data) < length:
+        chunk = sock.recv(length - len(data))
+        if not chunk:
+            raise StepFailed("connection closed")
+        data += chunk
+    return data
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--qemu", default=os.path.join(DOCS, "qemu-ios/build/qemu-system-arm"))
-    parser.add_argument("--bootrom", default=os.path.join(DOCS, "ipod_touch_2g_emulation/bootrom_240_4"))
-    parser.add_argument("--nand", default=os.path.join(DOCS, "generate_nand_it2g/nand"))
-    parser.add_argument("--nor", default=os.path.join(DOCS, "generate_nor_it2g/nor.bin"))
+    add_arguments(parser)
     parser.add_argument("--firmware", default=os.path.expanduser(
         "~/Downloads/iPod2,1_2.1.1_5F138_Restore/Firmware/dfu"))
-    return run(parser.parse_args())
+    parser.add_argument("--ios", action="store_true",
+                        help="instead, boot iOS from a clone of the NAND and check usbmux (takes minutes)")
+    args = parser.parse_args()
+    return run_ios(args) if args.ios else run(args)
 
 
 if __name__ == "__main__":

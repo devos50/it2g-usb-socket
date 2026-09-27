@@ -57,12 +57,37 @@ accesses.
   only connects when every function of the USB configuration (including PTP)
   has registered.
 
+## Running iOS with libimobiledevice
+
+`run_ios.py` boots iOS from the NAND with the USB link and serves it through
+the usbmuxd bridge, in one command (`--headless` for no window,
+`--scratch-nand` to boot a throwaway clone so the NAND is not modified):
+
+```
+python3 run_ios.py --scratch-nand
+export USBMUXD_SOCKET_ADDRESS=127.0.0.1:27015
+idevicepair pair
+idevicesyslog
+afcclient ls /
+ideviceinstaller list --system
+```
+
+Tested on iOS 2.1.1: pairing, `ideviceinfo`, `idevicesyslog` (needs the
+syslogd launch daemon), AFC (`afcclient`, ~20 MB/s up, ~55 MB/s down),
+`ideviceinstaller`, `idevicenotificationproxy`, `idevicename`, `idevicedate`
+and `iproxy`. `idevicediagnostics` and `idevicecrashreport` use services that
+iOS 2 does not have.
+
 ## Smoke test
 
 `python3 smoke_test.py` starts its own QEMU (paths default to the usual
 locations, see `--help`), walks DFU -> iBSS -> iBEC over USB and checks
 enumeration, commands, the serial console, uploads and `go`. It takes a few
 seconds and exits non-zero on failure.
+
+`python3 smoke_test.py --ios` instead boots iOS from a clone of the NAND and
+checks that it attaches through the usbmuxd bridge and answers lockdownd
+(about 15 s when headless).
 
 ## Booting iBEC over USB
 
