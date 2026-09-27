@@ -113,6 +113,25 @@ class PcapWriter:
         self.file.close()
 
 
+def parse_configuration(data):
+    """Splits a full configuration descriptor into a dict with the
+    configuration fields and a list of interfaces, each with its endpoints."""
+    config = {"value": data[5], "string": data[6], "attributes": data[7], "max_power": data[8] * 2, "interfaces": []}
+    offset = data[0]
+    while offset + 2 <= len(data) and data[offset] >= 2:
+        length, desc_type = data[offset], data[offset + 1]
+        d = data[offset:offset + length]
+        if desc_type == 0x04 and length >= 9:
+            config["interfaces"].append({
+                "number": d[2], "alt": d[3], "class": d[5], "subclass": d[6], "protocol": d[7],
+                "string": d[8], "endpoints": []})
+        elif desc_type == 0x05 and length >= 7 and config["interfaces"]:
+            config["interfaces"][-1]["endpoints"].append({
+                "address": d[2], "type": d[3] & 3, "max_packet": struct.unpack_from("<H", d, 4)[0] & 0x7ff})
+        offset += length
+    return config
+
+
 class USBLink:
     def __init__(self, host="127.0.0.1", port=1235, pcap=None):
         self.sock = socket.create_connection((host, port))
@@ -268,6 +287,16 @@ class USBLink:
     def get_string(self, index, timeout=None):
         desc = self.get_descriptor(0x03, index, 0xFF, 0x0409, timeout)
         return desc[2:desc[0]].decode("utf-16-le")
+
+    def get_configurations(self, num_configs, timeout=None):
+        """Reads configuration descriptors 0..num_configs-1 and returns them
+        as parsed by parse_configuration."""
+        configs = []
+        for index in range(num_configs):
+            header = self.get_descriptor(0x02, index, 9, timeout=timeout)
+            total = struct.unpack_from("<H", header, 2)[0]
+            configs.append(parse_configuration(self.get_descriptor(0x02, index, total, timeout=timeout)))
+        return configs
 
     def wait_for_device(self, timeout=30):
         """Resets the bus until the device answers, like a host does when a

@@ -60,6 +60,17 @@ def cmd_info(link, desc, args):
         if index:
             print("%s: %s" % (name, link.get_string(index)))
 
+    ep_types = ("control", "isoc", "bulk", "interrupt")
+    for config in link.get_configurations(desc[17]):
+        name = link.get_string(config["string"]) if config["string"] else ""
+        print("Configuration %d: %s (%d mA)" % (config["value"], name, config["max_power"]))
+        for intf in config["interfaces"]:
+            name = link.get_string(intf["string"]) if intf["string"] else ""
+            print("  Interface %d alt %d: class %02x/%02x/%02x %s" % (
+                intf["number"], intf["alt"], intf["class"], intf["subclass"], intf["protocol"], name))
+            for ep in intf["endpoints"]:
+                print("    Endpoint 0x%02x %s, max packet %d" % (ep["address"], ep_types[ep["type"]], ep["max_packet"]))
+
 
 def cmd_cmd(link, desc, args):
     return 0 if send_command(link, " ".join(args.command)) else 1
