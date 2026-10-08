@@ -147,3 +147,21 @@ python3 recovery.py shell
 iBoot stalls a command request when the command is unknown or fails, and it
 has no way to return command output over EP0; output appears on the serial
 console (`shell`) instead.
+
+## Booting the restore ramdisk
+
+`restore_boot.py` does what iTunes does at the start of a restore: DFU ->
+iBSS -> iBEC, then uploads the restore ramdisk (`ramdisk`) and the kernelcache
+and runs `bootx`. The ramdisk kernel then starts `restored`, which listens on
+the lockdown port over usbmux:
+
+```
+python3 restore_boot.py --query
+```
+
+`--query` asks restored for its type (`com.apple.mobile.restored`, restore
+protocol version 11), `--bridge` serves the device to libimobiledevice, and
+`--update` boots the update ramdisk instead. The NAND is a throwaway clone
+unless `--persistent-nand` is given. The release iBEC ignores `boot-args` and
+boots with `rd=md0 nand-enable-reformat=1 -progress`, so the kernel prints
+nothing on the serial port; the display shows the progress bar.
