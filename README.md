@@ -195,3 +195,28 @@ restored reads its options from the ramdisk
 so every step runs. The docstring of restore.py lists restored_external's
 steps and their progress operations. A full restore takes about 45 s and ends
 with `status: 0`; the restored NAND boots to lockdownd.
+
+## Booting a restored device to SpringBoard
+
+A stock restore stays at the Apple logo: SpringBoard uses the MBX 2D core,
+which the emulator does not model, and the device is unactivated.
+`prepare_restored.py` changes the restored NAND so that it boots to
+SpringBoard. It sets `LK_ENABLE_MBX2D=0` for SpringBoard, so LayerKit draws
+in software. With `--lockdown` it also installs the Lockdown directory of an
+activated device (from a directory, or from a filesystem image under
+`/private/var/root/Library/Lockdown`):
+
+```
+python3 restore_boot.py --restore --output ~/it2g-restored
+python3 prepare_restored.py ~/it2g-restored \
+    --lockdown ~/Documents/generate_nand_it2g/filesystem-it2g-writable.orig.dmg
+python3 run_ios.py --nand ~/it2g-restored/nand --nor ~/it2g-restored/nor.bin
+```
+
+The root filesystem can't be changed before the restore instead, because asr
+checks Apple's signature of the image. So the script edits the NAND
+afterwards with `nand_disk.py`, `add_files.py` and `generate_nand --disk`
+from generate_nand_it2g (`--tools`). The original NAND stays in
+`nand.restored`. An activation record only activates the device it was made
+for, and it can't be sent to lockdownd again: it has to contain the random
+value that lockdownd generates for each activation.
