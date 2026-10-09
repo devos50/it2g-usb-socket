@@ -50,9 +50,11 @@ class Emulator:
     display: show the QEMU window instead of running headless.
     scratch_nand: boot a copy-on-write clone of the NAND, so the run does not
     modify it (the clone is removed by stop()).
+    scratch_nor: the same for the NOR, which the restore flashes.
     """
 
-    def __init__(self, args, workdir, dfu=False, display=False, scratch_nand=False, extra_args=()):
+    def __init__(self, args, workdir, dfu=False, display=False, scratch_nand=False, scratch_nor=False,
+                 extra_args=()):
         self.port = free_port()
         self.workdir = workdir
         self.serial_log = os.path.join(workdir, "serial.log")
@@ -63,8 +65,14 @@ class Emulator:
             os.rmdir(self.scratch_nand)
             subprocess.run(["cp", "-Rc", args.nand, self.scratch_nand], check=True)
             self.nand = self.scratch_nand
+        self.nor = args.nor
+        self.scratch_nor = None
+        if scratch_nor:
+            self.scratch_nor = os.path.join(workdir, "nor.bin")
+            subprocess.run(["cp", "-c", args.nor, self.scratch_nor], check=True)
+            self.nor = self.scratch_nor
 
-        machine = "iPod-Touch,bootrom=%s,nand=%s,nor=%s,usb-chardev=usb" % (args.bootrom, self.nand, args.nor)
+        machine = "iPod-Touch,bootrom=%s,nand=%s,nor=%s,usb-chardev=usb" % (args.bootrom, self.nand, self.nor)
         if dfu:
             machine += ",dfu=on"
         cmd = [
@@ -111,3 +119,5 @@ class Emulator:
         self.log.close()
         if self.scratch_nand:
             shutil.rmtree(self.scratch_nand, ignore_errors=True)
+        if self.scratch_nor:
+            os.remove(self.scratch_nor)

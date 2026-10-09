@@ -168,22 +168,30 @@ nothing on the serial port; the display shows the progress bar.
 
 ## Running the restore
 
-`restore.py` is the host side of the restore protocol. `restore_boot.py
---restore` boots the ramdisk and runs it:
+`restore.py` is the host side of the restore protocol, and `restore_boot.py
+--restore` boots the ramdisk and runs it. With `--output DIR` the restore
+writes copies of the NAND and NOR in `DIR`, which then boot like a restored
+device:
 
 ```
-python3 restore_boot.py --restore
+python3 restore_boot.py --restore --output ~/it2g-restored
+python3 run_ios.py --nand ~/it2g-restored/nand --nor ~/it2g-restored/nor.bin
 ```
 
-It sends `StartRestore` to restored and prints each `ProgressMsg`. It answers
-each `DataRequestMsg` with a handler for its `DataType` and stops at the final
-`StatusMsg`, printing restored's log if the restore failed. restored reads its
-options from the ramdisk (`/usr/local/share/restore/options.plist`, absent in
-5F138), not from the host, so every step runs. The docstring of restore.py
-lists restored_external's steps and their progress operations.
+The client sends `StartRestore` to restored, prints each `ProgressMsg`, and
+answers each `DataRequestMsg`:
 
-Currently the restore partitions the NAND and runs `newfs_hfs` on both
-partitions. It then asks for `SystemImageData`, starts `asr` on device port
-12345, and stops there: the host connects and receives `{Command: Initiate}`,
-but serving the root filesystem image over ASR is not implemented yet.
-`NORData` (LLB and the other NOR img3 files) is not implemented yet either.
+- `SystemImageData`: restored starts `asr` on device port 12345. The client
+  connects and streams the root filesystem DMG from the IPSW as-is (it is
+  FileVault-encrypted; asr on the device decrypts it). asr messages are bare
+  XML plists without a length prefix.
+- `NORData`: LLB and the other NOR img3 files in all_flash manifest order. The
+  kernel personalizes each image (encrypts its SHSH signature with the
+  UID-derived key 0x89a) before flashing it. The local IPSW lacks these files,
+  so they come from `--nor-images` (default `~/Documents/generate_nor_it2g/data`).
+
+restored reads its options from the ramdisk
+(`/usr/local/share/restore/options.plist`, absent in 5F138), not from the host,
+so every step runs. The docstring of restore.py lists restored_external's
+steps and their progress operations. A full restore takes about 45 s and ends
+with `status: 0`; the restored NAND boots to lockdownd.

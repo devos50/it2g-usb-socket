@@ -9,7 +9,9 @@ The device then runs `restored`, which listens on the lockdown port over
 usbmux. --query sends it QueryType, --restore runs the restore
 with restore.py, and with --bridge the usbmuxd bridge serves
 it on 127.0.0.1:27015 (USBMUXD_SOCKET_ADDRESS). The NAND is a throwaway clone
-unless --persistent-nand is given. Ctrl-C stops QEMU.
+unless --persistent-nand is given; --output DIR restores into copies in DIR
+instead, which run_ios.py boots with --nand DIR/nand --nor DIR/nor.bin. Ctrl-C
+stops QEMU.
 
 The release iBEC ignores the boot-args variable and boots the ramdisk with
 "rd=md0 nand-enable-reformat=1 -progress", so the kernel prints nothing on the
@@ -20,6 +22,7 @@ import os
 import plistlib
 import signal
 import struct
+import subprocess
 import sys
 import tempfile
 import threading
@@ -43,6 +46,12 @@ def restore_images(ipsw, update):
     ramdisk = ramdisks["Update" if update else "User"]
     kernel = plist["RestoreKernelCaches"]["Release"]
     return os.path.join(ipsw, ramdisk), os.path.join(ipsw, kernel)
+
+
+def system_image(ipsw):
+    with open(os.path.join(ipsw, "Restore.plist"), "rb") as f:
+        plist = plistlib.load(f)
+    return os.path.join(ipsw, plist["SystemRestoreImages"]["User"])
 
 
 def read(path):
@@ -125,9 +134,9 @@ def query_restored(emu, timeout):
             link.close()
 
 
-def restore(emu, timeout):
+def restore(emu, args, timeout):
     """Waits for restored and runs the restore with restore.py."""
-    from restore import RestoreError, probe_asr, run_restore
+    from restore import ASRServer, NORServer, RestoreError, nor_image_paths, run_restore
     from usbmux import MuxError
     link = emu.connect()
     start = time.monotonic()
@@ -135,8 +144,13 @@ def restore(emu, timeout):
     print("ok    device on USB, %04x:%04x               %.2f s"
           % (*struct.unpack_from("<HH", desc, 8), time.monotonic() - start), flush=True)
     try:
-        status = run_restore(link, {"SystemImageData": probe_asr},
-                             log=lambda text: print(text, flush=True))
+        log = lambda text: print(text, flush=True)
+        handlers = {
+            "SystemImageData": ASRServer(system_image(args.ipsw), log=log),
+            "NORData": NORServer(*nor_image_paths(args.ipsw, args.nor_images), log=log),
+        }
+        status = run_restore(link, handlers,
+                             log=log)
     except (RestoreError, MuxError) as e:
         raise EmulatorError("restore: %s" % e)
     if status != 0:
@@ -155,7 +169,11 @@ def main():
     parser.add_argument("--update", action="store_true", help="boot the update ramdisk instead of the restore one")
     parser.add_argument("--display", action="store_true", help="show the QEMU window")
     parser.add_argument("--persistent-nand", action="store_true",
-                        help="let the restore write the real NAND instead of a throwaway clone")
+                        help="let the restore write the real NAND and NOR instead of throwaway clones")
+    parser.add_argument("--output", metavar="DIR",
+                        help="restore into copies of the NAND and NOR in DIR (DIR/nand, DIR/nor.bin) and keep them")
+    parser.add_argument("--nor-images", default=os.path.join(emulator.DOCS, "generate_nor_it2g/data"),
+                        help="NOR img3 files to use when the IPSW lacks them (generate_nor names)")
     parser.add_argument("--bridge", action="store_true", help="serve the device through the usbmuxd bridge")
     parser.add_argument("--listen", default="127.0.0.1:27015")
     parser.add_argument("--query", action="store_true", help="wait for restored and send it QueryType")
@@ -165,9 +183,20 @@ def main():
     parser.add_argument("qemu_args", nargs="*", help="extra QEMU arguments, after --")
     args = parser.parse_args()
 
+    if args.output:
+        if os.path.exists(os.path.join(args.output, "nand")) or os.path.exists(os.path.join(args.output, "nor.bin")):
+            parser.error("%s already contains a nand or nor.bin" % args.output)
+        os.makedirs(args.output, exist_ok=True)
+        subprocess.run(["cp", "-Rc", args.nand, os.path.join(args.output, "nand")], check=True)
+        subprocess.run(["cp", "-c", args.nor, os.path.join(args.output, "nor.bin")], check=True)
+        args.nand = os.path.join(args.output, "nand")
+        args.nor = os.path.join(args.output, "nor.bin")
+        args.persistent_nand = True
+
     workdir = tempfile.mkdtemp(prefix="it2g-restore-")
     emu = emulator.Emulator(args, workdir, dfu=True, display=args.display,
-                            scratch_nand=not args.persistent_nand, extra_args=args.qemu_args)
+                            scratch_nand=not args.persistent_nand,
+                            scratch_nor=not args.persistent_nand, extra_args=args.qemu_args)
     print("QEMU logs in %s" % workdir, flush=True)
     signal.signal(signal.SIGTERM, stop_on_sigterm)
 
@@ -180,7 +209,7 @@ def main():
         if args.query:
             query_restored(emu, timeout=120)
         if args.restore:
-            restore(emu, timeout=120)
+            restore(emu, args, timeout=120)
         if args.bridge:
             from usbmuxd import DEFAULT_PAIR_RECORDS, start_bridge
             start_bridge(args.listen, port=emu.port, pair_records=DEFAULT_PAIR_RECORDS)

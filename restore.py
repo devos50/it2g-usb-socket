@@ -3,7 +3,10 @@ Drives a restore with the restore ramdisk's `restored` (iOS 2.1.1), the way
 iTunes does after the ramdisk has booted. Usually run through
 `restore_boot.py --restore`.
 
-  python3 restore.py [--port 1235]
+  python3 restore.py [--port 1235] [--ipsw DIR] [--nor-images DIR]
+
+It serves the root filesystem (SystemRestoreImages in Restore.plist) to asr
+and the NOR images (in all_flash manifest order) to restored.
 
 restored listens on the lockdown port over usbmux and speaks length-prefixed
 XML plists like lockdownd. StartRestore starts the whole restore; restored
@@ -31,6 +34,7 @@ Steps in restored_external (progress operation in brackets):
   set_auto_boot_delay
 """
 import argparse
+import os
 import plistlib
 import struct
 import sys
@@ -190,16 +194,101 @@ def connect_asr(client, timeout=60):
             time.sleep(0.5)
 
 
-def probe_asr(client, message, timeout=60):
-    """SystemImageData handler that only connects to asr and reports what it
-    asks for, then stops the restore."""
-    conn = connect_asr(client, timeout)
-    try:
-        first = conn.recv(timeout=timeout)
-        client.log("asr: %s" % first)
-    finally:
-        conn.close()
-    raise RestoreError("stopping at the system image (no image handler)")
+class ASRServer:
+    """Serves a disk image to asr on the device, like iTunes. asr first asks
+    for pieces of the image out of band (the image's metadata), then for the
+    whole image as one stream that it writes to the target partition."""
+
+    PAYLOAD_CHUNK = 0x20000
+
+    def __init__(self, path, log=print):
+        self.path = path
+        self.log = log
+
+    def __call__(self, client, message, timeout=60):
+        conn = connect_asr(client, timeout)
+        try:
+            self.serve(conn)
+        finally:
+            conn.close()
+
+    def serve(self, conn):
+        size = os.path.getsize(self.path)
+        initiate = conn.recv()
+        if initiate.get("Command") != "Initiate":
+            raise RestoreError("asr: expected Initiate, got %s" % initiate)
+        self.log("asr: initiate %s" % {k: v for k, v in initiate.items() if k != "Command"})
+        conn.send({
+            "FEC Slice Stride": 40,
+            "Packet Payload Size": 1450,
+            "Packets Per FEC": 25,
+            "Payload": {"Port": 1, "Size": size},
+            "Stream ID": 1,
+            "Version": 1,
+        })
+        with open(self.path, "rb") as f:
+            while True:
+                request = conn.recv(timeout=300)
+                command = request.get("Command")
+                if command == "OOBData":
+                    offset, length = request["OOB Offset"], request["OOB Length"]
+                    f.seek(offset)
+                    conn.conn.send(f.read(length))
+                elif command == "Payload":
+                    break
+                else:
+                    raise RestoreError("asr: unexpected request %s" % request)
+            self.log("asr: sending the %d MB image" % (size >> 20))
+            f.seek(0)
+            start = time.monotonic()
+            sent = 0
+            next_report = 0
+            while True:
+                chunk = f.read(self.PAYLOAD_CHUNK)
+                if not chunk:
+                    break
+                conn.conn.send(chunk)
+                sent += len(chunk)
+                if sent * 10 // size >= next_report:
+                    self.log("asr: %3d%%  %.1f MB/s" % (sent * 100 // size,
+                                                      sent / 1e6 / max(time.monotonic() - start, 1e-3)))
+                    next_report = sent * 10 // size + 1
+
+
+def nor_image_paths(ipsw, fallback_dir=None):
+    """Returns (LLB, [other images]) in the order of the all_flash manifest.
+    Images missing from the IPSW are taken from fallback_dir under the names
+    generate_nor uses (llb.img3, iboot.img3, dtree.img3, applelogo.img3...)."""
+    flash = os.path.join(ipsw, "Firmware", "all_flash", "all_flash.n72ap.production")
+    with open(os.path.join(flash, "manifest")) as f:
+        names = [line.strip() for line in f if line.strip()]
+    paths = []
+    for name in names:
+        path = os.path.join(flash, name)
+        if not os.path.exists(path) and fallback_dir:
+            short = name.split(".")[0].lower().replace("devicetree", "dtree")
+            path = os.path.join(fallback_dir, short + ".img3")
+        if not os.path.exists(path):
+            raise RestoreError("NOR image %s not found" % name)
+        paths.append(path)
+    return paths[0], paths[1:]
+
+
+class NORServer:
+    """Answers the NORData request with LLB and the other NOR images, which
+    restored flashes through AppleImage3NORAccess."""
+
+    def __init__(self, llb, images, log=print):
+        self.llb = llb
+        self.images = images
+        self.log = log
+
+    def __call__(self, client, message):
+        def read(path):
+            with open(path, "rb") as f:
+                return f.read()
+        self.log("nor: %s" % ", ".join(os.path.basename(p) for p in [self.llb] + self.images))
+        client.conn.send({"LlbImageData": read(self.llb), "NorImageData": [read(p) for p in self.images]})
 
 
 def run_restore(link, data_handlers=None, log=print):
@@ -223,9 +312,19 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=1235)
+    parser.add_argument("--ipsw", default=os.path.expanduser("~/Downloads/iPod2,1_2.1.1_5F138_Restore"),
+                        help="extracted IPSW directory")
+    parser.add_argument("--nor-images", default=os.path.expanduser("~/Documents/generate_nor_it2g/data"),
+                        help="NOR img3 files to use when the IPSW lacks them (generate_nor names)")
     args = parser.parse_args()
     try:
-        status = run_restore(USBLink(args.host, args.port), {"SystemImageData": probe_asr})
+        with open(os.path.join(args.ipsw, "Restore.plist"), "rb") as f:
+            system_image = os.path.join(args.ipsw, plistlib.load(f)["SystemRestoreImages"]["User"])
+        handlers = {
+            "SystemImageData": ASRServer(system_image),
+            "NORData": NORServer(*nor_image_paths(args.ipsw, args.nor_images)),
+        }
+        status = run_restore(USBLink(args.host, args.port), handlers)
     except (RestoreError, MuxError, USBError) as e:
         print("error: %s" % e, file=sys.stderr)
         return 1
