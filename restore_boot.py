@@ -3,10 +3,11 @@ Boots the restore ramdisk of an IPSW in the emulator, the way iTunes starts a
 restore: DFU -> iBSS -> iBEC, then upload the ramdisk and kernelcache over USB
 and `bootx`.
 
-  python3 restore_boot.py [--ipsw DIR] [--update] [--display] [--query] [--bridge]
+  python3 restore_boot.py [--ipsw DIR] [--update] [--display] [--query] [--restore] [--bridge]
 
 The device then runs `restored`, which listens on the lockdown port over
-usbmux. --query sends it QueryType, and with --bridge the usbmuxd bridge serves
+usbmux. --query sends it QueryType, --restore runs the restore
+with restore.py, and with --bridge the usbmuxd bridge serves
 it on 127.0.0.1:27015 (USBMUXD_SOCKET_ADDRESS). The NAND is a throwaway clone
 unless --persistent-nand is given. Ctrl-C stops QEMU.
 
@@ -124,6 +125,24 @@ def query_restored(emu, timeout):
             link.close()
 
 
+def restore(emu, timeout):
+    """Waits for restored and runs the restore with restore.py."""
+    from restore import RestoreError, probe_asr, run_restore
+    from usbmux import MuxError
+    link = emu.connect()
+    start = time.monotonic()
+    desc = link.wait_for_device(timeout=timeout)
+    print("ok    device on USB, %04x:%04x               %.2f s"
+          % (*struct.unpack_from("<HH", desc, 8), time.monotonic() - start), flush=True)
+    try:
+        status = run_restore(link, {"SystemImageData": probe_asr},
+                             log=lambda text: print(text, flush=True))
+    except (RestoreError, MuxError) as e:
+        raise EmulatorError("restore: %s" % e)
+    if status != 0:
+        raise EmulatorError("restore failed with status %s" % status)
+
+
 def stop_on_sigterm(signum, frame):
     # Clean up as on Ctrl-C.
     raise KeyboardInterrupt
@@ -140,6 +159,7 @@ def main():
     parser.add_argument("--bridge", action="store_true", help="serve the device through the usbmuxd bridge")
     parser.add_argument("--listen", default="127.0.0.1:27015")
     parser.add_argument("--query", action="store_true", help="wait for restored and send it QueryType")
+    parser.add_argument("--restore", action="store_true", help="run the restore (restore.py) once restored is up")
     parser.add_argument("--wait", type=float, default=0,
                         help="stop after this many seconds (0: run until Ctrl-C or QEMU exits)")
     parser.add_argument("qemu_args", nargs="*", help="extra QEMU arguments, after --")
@@ -159,6 +179,8 @@ def main():
             link.close()
         if args.query:
             query_restored(emu, timeout=120)
+        if args.restore:
+            restore(emu, timeout=120)
         if args.bridge:
             from usbmuxd import DEFAULT_PAIR_RECORDS, start_bridge
             start_bridge(args.listen, port=emu.port, pair_records=DEFAULT_PAIR_RECORDS)

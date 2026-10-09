@@ -165,3 +165,25 @@ protocol version 11), `--bridge` serves the device to libimobiledevice, and
 unless `--persistent-nand` is given. The release iBEC ignores `boot-args` and
 boots with `rd=md0 nand-enable-reformat=1 -progress`, so the kernel prints
 nothing on the serial port; the display shows the progress bar.
+
+## Running the restore
+
+`restore.py` is the host side of the restore protocol. `restore_boot.py
+--restore` boots the ramdisk and runs it:
+
+```
+python3 restore_boot.py --restore
+```
+
+It sends `StartRestore` to restored and prints each `ProgressMsg`. It answers
+each `DataRequestMsg` with a handler for its `DataType` and stops at the final
+`StatusMsg`, printing restored's log if the restore failed. restored reads its
+options from the ramdisk (`/usr/local/share/restore/options.plist`, absent in
+5F138), not from the host, so every step runs. The docstring of restore.py
+lists restored_external's steps and their progress operations.
+
+Currently the restore partitions the NAND and runs `newfs_hfs` on both
+partitions. It then asks for `SystemImageData`, starts `asr` on device port
+12345, and stops there: the host connects and receives `{Command: Initiate}`,
+but serving the root filesystem image over ASR is not implemented yet.
+`NORData` (LLB and the other NOR img3 files) is not implemented yet either.
