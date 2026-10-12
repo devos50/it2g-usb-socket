@@ -10,8 +10,8 @@ usbmux. --query sends it QueryType, --restore runs the restore
 with restore.py, and with --bridge the usbmuxd bridge serves
 it on 127.0.0.1:27015 (USBMUXD_SOCKET_ADDRESS). The NAND is a throwaway clone
 unless --persistent-nand is given; --output DIR restores into copies in DIR
-instead, which run_ios.py boots with --nand DIR/nand --nor DIR/nor.bin. Ctrl-C
-stops QEMU.
+instead, which run_ios.py boots with --nand DIR/nand --nor DIR/nor.bin, and
+stops QEMU once the restore succeeds. Otherwise Ctrl-C stops QEMU.
 
 The release iBEC ignores the boot-args variable and boots the ramdisk with
 "rd=md0 nand-enable-reformat=1 -progress", so the kernel prints nothing on the
@@ -210,6 +210,10 @@ def main():
             query_restored(emu, timeout=120)
         if args.restore:
             restore(emu, args, timeout=120)
+            if args.output and not args.bridge and not args.wait:
+                # The images are complete once restored reports success; nothing else to wait for.
+                print("restored device in %s" % args.output, flush=True)
+                return 0
         if args.bridge:
             from usbmuxd import DEFAULT_PAIR_RECORDS, start_bridge
             start_bridge(args.listen, port=emu.port, pair_records=DEFAULT_PAIR_RECORDS)
